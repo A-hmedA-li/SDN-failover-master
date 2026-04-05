@@ -55,28 +55,19 @@ import org.projectfloodlight.openflow.types.VlanVid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Failover-Aware Forwarding Module
- * 
- * This module discovers two paths between hosts, installs primary path with
- * normal flows, and installs backup path using OpenFlow group tables for
- * fast failover. It also measures failover latency when links go down.
- */
+
 public class FailoverForwarding implements IFloodlightModule, IOFMessageListener, ITopologyListener {
     
-    // Core Floodlight services
     protected IFloodlightProviderService floodlightProvider;
     protected IOFSwitchService switchService;
     protected ITopologyService topologyService;
     protected ILinkDiscoveryService linkDiscovery;
     
-    // Pre-configured host information
     private static final MacAddress HOST1_MAC = MacAddress.of("00:00:00:00:00:01");
     private static final MacAddress HOST2_MAC = MacAddress.of("00:00:00:00:00:02");
     private static final IPv4Address HOST1_IP = IPv4Address.of("10.0.0.1");
     private static final IPv4Address HOST2_IP = IPv4Address.of("10.0.0.2");
     
-    // Pre-configured switch DPID suffixes
     private static final DatapathId SWITCH1 = DatapathId.of("00:00:00:00:00:00:00:01");
     private static final DatapathId SWITCH2 = DatapathId.of("00:00:00:00:00:00:00:05");
     private HostInfo host1 = new  HostInfo(HOST1_MAC, HOST1_IP, SWITCH1, OFPort.of(1));
@@ -85,17 +76,12 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
     private static final int backupVlan = 200;  
     private static Logger log = LoggerFactory.getLogger(FailoverForwarding.class);
     
-    // Host learning tables
     
 
 
     private DFS path; 
-    // Module state
     private boolean isEnabled = true;
-    
-    /**
-     * Host information
-     */
+
     private static class HostInfo {
         MacAddress mac;
         IPv4Address ip;
@@ -546,7 +532,6 @@ private void installFailoverGroup(IOFSwitch sw, MacAddress sender, MacAddress ta
         .setGroup(OFGroup.of(groupId))
         .build();
     sw.write(deleteGroup);
-    // Bucket 1: Primary – set VLAN to primaryVlan and output
 
     OFFactory factory = sw.getOFFactory();
     OFAction pushVlanPrimary = sw.getOFFactory().actions().pushVlan(EthType.of(0x8100));
@@ -562,7 +547,6 @@ private void installFailoverGroup(IOFSwitch sw, MacAddress sender, MacAddress ta
         .setWatchPort(primaryOutPort)
         .build();
     
-    // Bucket 2: Backup – set VLAN to backupVlan and output 
     OFAction pushVlanBackup = sw.getOFFactory().actions().pushVlan(EthType.of(0x8100));
     OFAction setVlanBackup = sw.getOFFactory().actions().buildSetField().setField( sw.getOFFactory()
     .oxms().buildVlanVid().setValue(OFVlanVidMatch.ofVlan(backupVlan )).build()).build();
@@ -586,7 +570,6 @@ private void installFailoverGroup(IOFSwitch sw, MacAddress sender, MacAddress ta
         .build();
     sw.write(groupMod);
     
-    // Flow that sends to this group
      Match match = factory.buildMatch()
         .setExact(MatchField.ETH_TYPE, EthType.IPv4)
         .setExact(MatchField.ETH_SRC, sender)
