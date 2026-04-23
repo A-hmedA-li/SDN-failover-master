@@ -79,7 +79,7 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
     
 
 
-    private DFS path; 
+    private BFS path; 
     private boolean isEnabled = true;
 
     private static class HostInfo {
@@ -199,7 +199,7 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
     @Override
     public void topologyChanged(List<LDUpdate> linkUpdates) {
         log.info("=== Topology Change Detected ===");
-        path = new DFS(this.linkDiscovery);
+        path = new BFS(this.linkDiscovery);
 
     
         
@@ -318,7 +318,10 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
         path.setSrc(sender.switchId);
         path.setDst(target.switchId , target.port);
         List<List<connection>> multipath = path.findtwoPaths(sender.switchId);
-
+        if (multipath.size() ==1 ){
+            log.info("there is only one path");
+            return;
+        }
         log.info("There Are " + multipath.size() + " paths in the Topology");
         List<connection> pathPrimary = multipath.get(0); 
         List<connection> pathSecondery = multipath.get(1);
