@@ -16,7 +16,7 @@ import net.floodlightcontroller.linkdiscovery.internal.LinkInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class DFS {
+public class BFS {
     
     public boolean[] visited;         
     public Map<DatapathId , List<connection>> adj; 
@@ -29,6 +29,7 @@ public class DFS {
     public List<List<connection>> pathCollection; 
     private static Logger log = LoggerFactory.getLogger(FailoverForwarding.class);
 
+    // Helper class to store BFS state
     private class BFSState {
         DatapathId current;
         List<connection> pathSoFar;
@@ -39,7 +40,7 @@ public class DFS {
         }
     }
 
-    DFS(ILinkDiscoveryService linkDiscoveryService) {
+    BFS(ILinkDiscoveryService linkDiscoveryService) {
         pathCollection = new ArrayList<List<connection>>(); 
         path = new ArrayList<connection>();
         
@@ -56,8 +57,7 @@ public class DFS {
                 DatapathId dstSw = link.getDst();
           
                 OFPort dstPort = link.getDstPort(); 
-                if (!adj.containsKey(srcSw)) {                    if (!isSwitchInPath(con.sw, currentPath)) {
-
+                if (!adj.containsKey(srcSw)) {
                     adj.put(srcSw, new ArrayList<connection>()); 
                 }
     
@@ -101,8 +101,7 @@ public class DFS {
             if (current.equals(dstsw)) {
                 List<connection> copypath = new ArrayList<connection>();
              
-                                    if (!isSwitchInPath(con.sw, currentPath)) {
-
+                
 
                 copypath.add(currentPath.get(0));
          
