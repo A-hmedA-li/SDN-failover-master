@@ -6,6 +6,12 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
@@ -22,11 +28,12 @@ import net.floodlightcontroller.topology.ITopologyService;
 import net.floodlightcontroller.topology.ITopologyListener;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscovery.LDUpdate;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryService;
-
+import net.floodlightcontroller.linkdiscovery.Link;
 import net.floodlightcontroller.packet.ARP;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
 
+import org.checkerframework.checker.nullness.qual.NonNull;
 import org.projectfloodlight.openflow.protocol.OFBucket;
 import org.projectfloodlight.openflow.protocol.OFFactory;
 import org.projectfloodlight.openflow.protocol.OFFlowAdd;
@@ -45,7 +52,6 @@ import org.projectfloodlight.openflow.protocol.match.MatchField;
 import org.projectfloodlight.openflow.types.DatapathId;
 import org.projectfloodlight.openflow.types.EthType;
 import org.projectfloodlight.openflow.types.IPv4Address;
-import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.MacAddress;
 import org.projectfloodlight.openflow.types.OFGroup;
 import org.projectfloodlight.openflow.types.OFPort;
@@ -75,12 +81,17 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
     private static final int primaryVlan = 100 ;
     private static final int backupVlan = 200;  
     private static Logger log = LoggerFactory.getLogger(FailoverForwarding.class);
-    
+    private final Map<MacAddress, HostInfo> learnedHosts = new ConcurrentHashMap<>();
+    private final Map<IPv4Address, MacAddress> ipToMac = new ConcurrentHashMap<>();
+    private final Map<String, Long> seenBroadcasts = new ConcurrentHashMap<>();
+    private static final long BROADCAST_TTL_MS = 500;
     
 
 
     private BFS path; 
     private boolean isEnabled = true;
+    private PheromoneTable pheromoneTable =  new PheromoneTable();
+
 
     private static class HostInfo {
         MacAddress mac;
@@ -166,7 +177,7 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
             log.info("=== Starting FailoverForwarding Module === ");
             floodlightProvider.addOFMessageListener(OFType.PACKET_IN, this);
             topologyService.addListener(this);
-            log.info("FailoverForwarding started - ready for fast failover");
+
         } catch (Exception e) {
             log.error("Failed to start FailoverForwarding: {}");
             isEnabled = false;
@@ -200,10 +211,7 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
     public void topologyChanged(List<LDUpdate> linkUpdates) {
         log.info("=== Topology Change Detected ===");
         path = new BFS(this.linkDiscovery);
-
-    
-        
-     
+        pheromoneTable.updateTopology(linkDiscovery.getLinks());
     }
     
     // ==================== Packet Processing ====================
@@ -221,96 +229,179 @@ public class FailoverForwarding implements IFloodlightModule, IOFMessageListener
             return OFPort.TABLE;
         }
     }
-    
-    private Command handlePacketIn(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx) {
-        Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, 
-            IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
-        if (eth == null) {
-            return Command.CONTINUE;
-        }
-        
-        
-
- 
-        if (eth.getEtherType() == EthType.ARP) {
-            OFPort inPort = getIngressPort(pi);
-            // return handleIPv4(sw, pi, eth, inPort, cntx);
-            return handleARP(sw, pi, eth, inPort, cntx);
-        }
-        
-        // Handle IPv4
-        if (eth.getEtherType() == EthType.IPv4) {
-            OFPort inPort = getIngressPort(pi);
-            log.info(" ............ IPv4 ..........");
- 
 
 
-            return handleIPv4(sw, pi, eth, inPort, cntx);
-        }
-        
-       
-        return Command.CONTINUE;
-    }
-    
-    private Command handleARP(IOFSwitch sw, OFPacketIn pi, Ethernet eth, 
-                              OFPort inPort, FloodlightContext cntx) {
+    private void learnHost(IOFSwitch sw, OFPort inPort, Ethernet eth) {
+    MacAddress srcMac = eth.getSourceMACAddress();
+    IPv4Address srcIp = null;
+
+    if (eth.getEtherType() == EthType.IPv4) {
+        IPv4 ip = (IPv4) eth.getPayload();
+        srcIp = ip.getSourceAddress();
+    } else if (eth.getEtherType() == EthType.ARP) {
         ARP arp = (ARP) eth.getPayload();
         
-        MacAddress senderMac = MacAddress.of(arp.getSenderHardwareAddress().getBytes());
-        HostInfo sender; 
-        HostInfo target;
-        if (senderMac.equals(host1.mac)){
-            log.info ("sender is h1");
-            sender = host1;
-            target = host2; 
-        }else{
-            sender = host2;
-            target = host1; 
-        }
+        srcIp = IPv4Address.of(arp.getSenderProtocolAddress().getBytes());
+    }
 
-        log.info("Arp");
+    HostInfo info = new HostInfo(srcMac, srcIp, sw.getId(), inPort);
+    learnedHosts.put(srcMac, info);
 
-        log.info ("sender: " + sender.mac + " target: " + target.mac);
-        path.setSrc(sender.switchId);
-        path.setDst(target.switchId , target.port);
-        List<List<connection>> multipath = path.findtwoPaths(sender.switchId);
-        for (List<connection> paths : multipath){
-    
+    if (srcIp != null) {
+        ipToMac.put(srcIp, srcMac);
+    }
+}
 
-      
-        for (connection con: paths){
+private HostInfo getKnownHost(MacAddress mac, IPv4Address ip) {
+    if (mac != null) {
+        HostInfo byMac = learnedHosts.get(mac);
+        if (byMac != null) return byMac;
+    }
 
-            IOFSwitch pathsw = switchService.getSwitch(con.sw); 
-
-            
-            installArpMatch(pathsw, senderMac , con.port);
+    if (ip != null) {
+        MacAddress learnedMac = ipToMac.get(ip);
+        if (learnedMac != null) {
+            HostInfo byIp = learnedHosts.get(learnedMac);
+            if (byIp != null) return byIp;
         }
     }
-        
+
+    if (HOST1_MAC.equals(mac) || HOST1_IP.equals(ip)) return host1;
+    if (HOST2_MAC.equals(mac) || HOST2_IP.equals(ip)) return host2;
+
+    return null;
+}
+
+private boolean isDuplicateBroadcast(Ethernet eth) {
+    if (eth.getEtherType() != EthType.ARP) {
+        return false;
+    }
+
+    ARP arp = (ARP) eth.getPayload();
+    String key = eth.getSourceMACAddress().toString() + "|" +
+                 IPv4Address.of(arp.getSenderProtocolAddress().asCidrMaskLength()) + "|" +
+                 IPv4Address.of(arp.getTargetProtocolAddress().asCidrMaskLength()) + "|" +
+                 arp.getOpCode();
+
+    long now = System.currentTimeMillis();
+    Long old = seenBroadcasts.put(key, now);
+
+    // simple cleanup
+    seenBroadcasts.entrySet().removeIf(e -> (now - e.getValue()) > BROADCAST_TTL_MS);
+
+    return old != null && (now - old) < BROADCAST_TTL_MS;
+}
+
+
+
+private void floodPacket(IOFSwitch sw, OFPacketIn pi, OFPort inPort) {
+    OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
+    pob.setData(pi.getData());
+    pob.setInPort(OFPort.CONTROLLER);
+
+    List<OFAction> actions = new ArrayList<>();
+    actions.add(sw.getOFFactory().actions().buildOutput()
+            .setPort(OFPort.FLOOD)
+            .build());
+
+    pob.setActions(actions);
+    sw.write(pob.build());
+}
+    
+    private Command handlePacketIn(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx) {
+    Ethernet eth = IFloodlightProviderService.bcStore.get(
+            cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
+
+    if (eth == null) {
+        return Command.CONTINUE;
+    }
+
+    OFPort inPort = getIngressPort(pi);
+
+    learnHost(sw, inPort, eth);
+
+    if (eth.getEtherType() == EthType.ARP) {
+        return handleARP(sw, pi, eth, inPort, cntx);
+    }
+
+    if (eth.getEtherType() == EthType.IPv4) {
+        log.info(" ............ IPv4 ..........");
+        return handleIPv4(sw, pi, eth, inPort, cntx);
+    }
+
+    return Command.CONTINUE;
+}
+    
+    private Command handleARP(IOFSwitch sw, OFPacketIn pi, Ethernet eth, OFPort inPort, FloodlightContext cntx) {
+    ARP arp = (ARP) eth.getPayload();
+
+    MacAddress senderMac = MacAddress.of(arp.getSenderHardwareAddress().getBytes());
+    IPv4Address senderIp = IPv4Address.of(arp.getSenderProtocolAddress().getBytes());
+    IPv4Address targetIp = IPv4Address.of(arp.getTargetProtocolAddress().getBytes());
+
+    HostInfo sender = getKnownHost(senderMac, senderIp);
+    HostInfo target = getKnownHost(null, targetIp);
+
+
+    // ARP request for unknown target: controlled flood, not dual-path install
+    if (arp.getOpCode().equals(ARP.OP_REQUEST) && target == null) {
+        if (isDuplicateBroadcast(eth)) {
+            return Command.STOP;
+        }
+
+        floodPacket(sw, pi, inPort);
         return Command.STOP;
     }
 
-    private Command handleIPv4(IOFSwitch sw, OFPacketIn pi, Ethernet eth, 
-                               OFPort inPort, FloodlightContext cntx) {
-        MacAddress senderMac = eth.getSourceMACAddress();
-        log.info("senderMAc  " +  senderMac.toString());
-        
-        
-        
-        HostInfo sender; 
-        HostInfo target;
-        if (senderMac.equals(host1.mac)){
-            sender = host1;
-            target = host2; 
-        }else{
-            sender = host2;
-            target = host1; 
-        }
-        log.info("IPv4");
-        
-        findAndInstall(sender, target);
-        //findAndInstall(target, sender);
+    // Known ARP target: use a single path install, not ARP over both paths
+    if (sender != null && target != null) {
 
+        path.setSrc(sender.switchId);
+        path.setDst(target.switchId, target.port);
+        List<List<connection>> multipath = path.findtwoPaths(sender.switchId);
+
+        if (multipath != null && !multipath.isEmpty()) {
+            List<connection> selectedPath = multipath.get(0);
+            for (connection con : selectedPath) {
+                IOFSwitch pathsw = switchService.getSwitch(con.sw);
+                if (pathsw != null) {
+                    installArpMatch(pathsw, senderMac, con.port);
+                }
+            }
+        }
+
+        return Command.STOP;
+    }
+
+    // fallback: flood once if we still cannot resolve both ends
+    if (!isDuplicateBroadcast(eth)) {
+        floodPacket(sw, pi, inPort);
+    }
+
+    return Command.STOP;
+}
+
+    private Command handleIPv4(IOFSwitch sw, OFPacketIn pi, Ethernet eth, OFPort inPort, FloodlightContext cntx) {
+        MacAddress senderMac = eth.getSourceMACAddress();
+        MacAddress targetMac = eth.getDestinationMACAddress();
+
+        HostInfo sender = getKnownHost(senderMac, null);
+        HostInfo target = getKnownHost(targetMac, null);
+
+        // fallback to fixed host behavior if dynamic learning has not resolved both ends yet
+        if (sender == null || target == null) {
+            log.info("Falling back to fixed host mapping for IPv4");
+            if (senderMac.equals(host1.mac)) {
+                sender = host1;
+                target = host2;
+            } else {
+                sender = host2;
+                target = host1;
+            }
+        }
+
+        log.info("IPv4 sender {} target {}", sender.mac, target.mac);
+        findAndInstall(sender, target);
         return Command.STOP;
     }
 
@@ -457,7 +548,33 @@ private Match createMatch(OFFactory factory , MacAddress sender , MacAddress tar
             .build();
         sw.write(flowMod);
     }
+private void installVlanCheck(IOFSwitch sw, MacAddress sender,  MacAddress target,
+                                   OFPort inPort, int backupVlan){
 
+            OFFactory factory = sw.getOFFactory();
+            Match.Builder matchBuilder = factory.buildMatch()
+            .setExact(MatchField.ETH_TYPE, EthType.IPv4)
+            .setExact(MatchField.ETH_SRC, sender)
+            .setExact(MatchField.ETH_DST, target)
+            .setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlan(backupVlan));
+            Match match = matchBuilder.build();
+            OFActionOutput outputAction = factory.actions().buildOutput()
+            .setPort(inPort)
+            .build();
+            List<OFAction> actions = new ArrayList<>();
+            actions.add(outputAction);
+            OFFlowMod flowMod = factory.buildFlowAdd()
+            .setMatch(match)
+            .setActions(actions)
+            .setPriority(90)  
+            .setIdleTimeout(0)
+            .setHardTimeout(0)
+            .build();
+    
+            sw.write(flowMod);
+
+                        
+            }
 
 private void installFailoverInterMadiete(IOFSwitch sw, MacAddress sender,  MacAddress target,
                                    OFPort primaryOutPort, int primaryVlan,
@@ -519,6 +636,7 @@ private void installFailoverInterMadiete(IOFSwitch sw, MacAddress sender,  MacAd
         .setPriority(100)
         .build();
     sw.write(flowMod);
+    installVlanCheck(sw , sender, target, backupOutPort , backupVlan);
 }
 
 
